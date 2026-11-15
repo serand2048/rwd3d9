@@ -42,7 +42,11 @@ static int *rsGlobal = AddressByVersion<int*>(0x8F4360, 0x8F4360, 0x8F4360, 0x9B
 // Ini present   -> logging enabled unless Log=0.
 static int g_cfgLoaded = 0;
 static int g_logEnabled = 0;
-static int g_retries = 20;
+static int g_retries = 3;
+static int g_setDisplayMode = 1;
+static int g_cfgPrinted = 0;
+static int g_releaseShaders = 1;   // ReleaseTrackedShaders on device re-creation
+static int g_releaseDevice = 1;    // Release the previous IDirect3DDevice9 ref
 static int g_retryDelayMs = 100;
 
 static void
@@ -72,6 +76,9 @@ LoadConfig(void)
 		if(sscanf(line, " Log=%d", &v) == 1 || sscanf(line, "Log=%d", &v) == 1){ g_logEnabled = v; continue; }
 		if(sscanf(line, " Retries=%d", &v) == 1 || sscanf(line, "Retries=%d", &v) == 1){ if(v >= 0 && v <= 100) g_retries = v; continue; }
 		if(sscanf(line, " RetryDelayMs=%d", &v) == 1 || sscanf(line, "RetryDelayMs=%d", &v) == 1){ if(v >= 10 && v <= 1000) g_retryDelayMs = v; continue; }
+		if(sscanf(line, " SetDisplayMode=%d", &v) == 1 || sscanf(line, "SetDisplayMode=%d", &v) == 1){ g_setDisplayMode = v; continue; }
+		if(sscanf(line, " ReleaseShaders=%d", &v) == 1 || sscanf(line, "ReleaseShaders=%d", &v) == 1){ g_releaseShaders = v; continue; }
+		if(sscanf(line, " ReleaseDevice=%d", &v) == 1 || sscanf(line, "ReleaseDevice=%d", &v) == 1){ g_releaseDevice = v; continue; }
 	}
 	fclose(f);
 }
@@ -80,6 +87,11 @@ static void
 LogRwd3d9(const char *fmt, ...)
 {
 	LoadConfig();
+	if(!g_cfgPrinted){
+		g_cfgPrinted = 1;
+		LogRwd3d9("config: log=%d setMode=%d retries=%d delay=%d relShaders=%d relDevice=%d",
+		          g_logEnabled, g_setDisplayMode, g_retries, g_retryDelayMs, g_releaseShaders, g_releaseDevice);
+	}
 	if(!g_logEnabled) return;
 
 	static FILE *f = NULL;
@@ -261,8 +273,8 @@ D3D8DeviceSystemStart_hook(void *a, void *b, void *c)
 	// re-created. rwd3d9 never released it, so each re-creation kept the old
 	// device alive and d3d8to9/D3D9 refused to create the new fullscreen one.
 	LoadConfig();
-	ReleaseTrackedShaders();
-	if(d3d9device){
+	if(g_releaseShaders) ReleaseTrackedShaders();
+	if(g_releaseDevice && d3d9device){
 		ULONG rc = d3d9device->Release();
 		LogRwd3d9("devstart #%d: released old device, refcount now %u%s", ++g_devStartCount, (unsigned)rc,
 		          rc ? "  <-- SOMEONE ELSE HOLDS THE DEVICE" : "");
@@ -274,6 +286,31 @@ D3D8DeviceSystemStart_hook(void *a, void *b, void *c)
 	// is still being torn down. Measured: the state clears within ~80 ms, so give
 	// it a proper window instead of letting RsRwInitialize fail and leave the game
 	// without a renderer.
+	// FIX: set the wanted display mode BEFORE the first device creation. When the
+	// previous device is still alive, a fullscreen CreateDevice for another mode
+	// fails with D3DERR_DEVICELOST; failed attempts also leave the game in a state
+	// where it spins forever on exit. Pre-setting the mode makes attempt #1 succeed.
+	if(g_setDisplayMode){
+		int w = rsGlobal ? rsGlobal[3] : 0;
+		int h = rsGlobal ? rsGlobal[4] : 0;
+		if(w >= 320 && w <= 7680 && h >= 200 && h <= 4320){
+			DEVMODEA cur = {0};
+			cur.dmSize = sizeof(cur);
+			EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &cur);
+			if((int)cur.dmPelsWidth != w || (int)cur.dmPelsHeight != h){
+				DEVMODEA dm = {0};
+				dm.dmSize = sizeof(dm);
+				dm.dmPelsWidth = w;
+				dm.dmPelsHeight = h;
+				dm.dmBitsPerPel = 32;
+				dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+				LONG st = ChangeDisplaySettingsA(&dm, 0);
+				LogRwd3d9("devstart #%d: pre-set display mode %dx%d (was %ux%u) -> %d",
+				          g_devStartCount, w, h, (unsigned)cur.dmPelsWidth, (unsigned)cur.dmPelsHeight, (int)st);
+			}
+		}
+	}
+
 	int ok = D3D8DeviceSystemStart(a, b, c);
 	if(!ok){
 		for(int attempt = 1; attempt <= g_retries; attempt++){
