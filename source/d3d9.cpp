@@ -1,4 +1,6 @@
 #include <windows.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <stdint.h>
 
 typedef long RwFixed;
@@ -27,11 +29,108 @@ void *Last9VertexShader = INVALID;
 RwUInt32 LastFVF = 0xFFFFFFFF;
 void *LastVertexDecl = INVALID;
 
+// --- minimal logging -------------------------------------------------------
+static int g_devStartCount = 0;
+
+// --- config (rwd3d9.ini next to gta3.exe) ---------------------------------
+// No ini at all -> logging fully disabled.
+// Ini present   -> logging enabled unless Log=0.
+static int g_cfgLoaded = 0;
+static int g_logEnabled = 0;
+static int g_retries = 20;
+static int g_retryDelayMs = 100;
+
+static void
+LoadConfig(void)
+{
+	if(g_cfgLoaded) return;
+	g_cfgLoaded = 1;
+
+	char path[MAX_PATH];
+	if(!GetModuleFileNameA(NULL, path, MAX_PATH)) return;
+	char *s = strrchr(path, (char)92);
+	if(!s) return;
+	lstrcpyA(s + 1, "rwd3d9.ini");
+
+	FILE *f = fopen(path, "r");
+	if(!f) return;              // no ini -> no logging at all
+	fclose(f);
+
+	f = fopen(path, "r");
+	if(!f) return;
+	g_logEnabled = 1;           // ini exists -> logging on by default
+
+	char line[256];
+	while(fgets(line, sizeof(line), f)){
+		if(line[0] == (char)59 || line[0] == (char)35 || line[0] == (char)91 || line[0] == 13 || line[0] == 10) continue;
+		int v;
+		if(sscanf(line, " Log=%d", &v) == 1 || sscanf(line, "Log=%d", &v) == 1){ g_logEnabled = v; continue; }
+		if(sscanf(line, " Retries=%d", &v) == 1 || sscanf(line, "Retries=%d", &v) == 1){ if(v >= 0 && v <= 100) g_retries = v; continue; }
+		if(sscanf(line, " RetryDelayMs=%d", &v) == 1 || sscanf(line, "RetryDelayMs=%d", &v) == 1){ if(v >= 10 && v <= 1000) g_retryDelayMs = v; continue; }
+	}
+	fclose(f);
+}
+
+static void
+LogRwd3d9(const char *fmt, ...)
+{
+	LoadConfig();
+	if(!g_logEnabled) return;
+
+	static FILE *f = NULL;
+	char path[MAX_PATH];
+	if(!f){
+		if(!GetModuleFileNameA(NULL, path, MAX_PATH)) return;
+		char *s = strrchr(path, '\\');
+		if(!s) return;
+		lstrcpyA(s + 1, "rwd3d9.log");
+		f = fopen(path, "a");
+		if(!f) return;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	fputc('\n', f);
+	va_end(ap);
+	fflush(f);
+}
+
+// --- FIX: track D3D9 shader objects -------------------------------------
+// A D3D9 shader object keeps a reference on the device it was created from.
+// SkyGfx never releases its shaders, so the old device stays alive and the
+// next CreateDevice (fullscreen, new mode) fails -> RsRwInitialize returns 0
+// -> engine is left without a renderer and the next teardown crashes.
+#define MAXTRACKEDSHADERS 64
+static IUnknown *trackedShaders[MAXTRACKEDSHADERS];
+static int numTrackedShaders = 0;
+
+static void TrackShader(void *shader)
+{
+	if(shader && numTrackedShaders < MAXTRACKEDSHADERS)
+		trackedShaders[numTrackedShaders++] = (IUnknown*)shader;
+}
+
+static void ReleaseTrackedShaders(void)
+{
+	for(int i = 0; i < numTrackedShaders; i++)
+		if(trackedShaders[i])
+			trackedShaders[i]->Release();
+	numTrackedShaders = 0;
+	LastPixelShader = 0xFFFFFFFF;
+	Last9VertexShader = INVALID;
+	Last8VertexShader = 0xFFFFFFFF;
+	LastFVF = 0xFFFFFFFF;
+	LastVertexDecl = INVALID;
+}
+
 IUnknown *&RwD3DDevice = *AddressByVersion<IUnknown**>(0x662EF0, 0x662EF0, 0x67342C, 0x7897A8, 0x7897B0, 0x7887B0);
 
 static uint32_t D3D8DeviceSystemStart_A = AddressByVersion<uint32_t>(0x5B7A50, 0x5B7D10, 0x5BC470, 0x65BFC0, 0x65C010, 0x65AF70); 
 static uint32_t RwD3D8GetCurrentD3DDevice_A = AddressByVersion<uint32_t>(0x5BA590, 0x5BA850, 0, 0x65F140, 0x65F190, 0x65E0F0); 
-WRAPPER int D3D8DeviceSystemStart(void) { VARJMP(D3D8DeviceSystemStart_A); }
+// FIX: original 0x5B7A50 is cdecl with THREE args (pushed by block 0x5B7698).
+// Before, the wrapper and the hook were declared with none, so after the jmp
+// the original read its arguments from the hook's stack frame instead.
+WRAPPER int D3D8DeviceSystemStart(void *a, void *b, void *c) { VARJMP(D3D8DeviceSystemStart_A); }
 
 
 
@@ -151,10 +250,55 @@ setshaderhook(void)
 
 // get d3d9 device when d3d8 device is created
 int
-D3D8DeviceSystemStart_hook(void)
+D3D8DeviceSystemStart_hook(void *a, void *b, void *c)
 {
-	if(D3D8DeviceSystemStart() == 0)
+	// FIX: release the previous IDirect3DDevice9 reference BEFORE the device is
+	// re-created. rwd3d9 never released it, so each re-creation kept the old
+	// device alive and d3d8to9/D3D9 refused to create the new fullscreen one.
+	LoadConfig();
+	ReleaseTrackedShaders();
+	if(d3d9device){
+		ULONG rc = d3d9device->Release();
+		LogRwd3d9("devstart #%d: released old device, refcount now %u%s", ++g_devStartCount, (unsigned)rc,
+		          rc ? "  <-- SOMEONE ELSE HOLDS THE DEVICE" : "");
+		d3d9device = NULL;
+	} else {
+		LogRwd3d9("devstart #%d: no previous device", ++g_devStartCount);
+	}
+	// FIX: the first attempt can fail with D3DERR_DEVICELOST - the previous device
+	// is still being torn down. Measured: the state clears within ~80 ms, so give
+	// it a proper window instead of letting RsRwInitialize fail and leave the game
+	// without a renderer.
+	int ok = D3D8DeviceSystemStart(a, b, c);
+	if(!ok){
+		for(int attempt = 1; attempt <= g_retries; attempt++){
+			LogRwd3d9("devstart #%d: failed, retry %d/%d", g_devStartCount, attempt, g_retries);
+			Sleep(g_retryDelayMs);
+			// The game has already written the wanted mode into RsGlobal before the
+			// restart; if the display is stuck in a transitional mode, a fullscreen
+			// CreateDevice keeps failing. Set the mode explicitly and retry.
+			if(attempt % 3 == 0){
+				DWORD w = *(DWORD*)0x8F436C, h = *(DWORD*)0x8F4370;
+				DEVMODEA dm = {0};
+				dm.dmSize = sizeof(dm);
+				dm.dmPelsWidth = w;
+				dm.dmPelsHeight = h;
+				dm.dmBitsPerPel = 32;
+				dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+				LONG st = ChangeDisplaySettingsA(&dm, 0);
+				LogRwd3d9("devstart #%d: forced display mode %ux%u -> %d", g_devStartCount, (unsigned)w, (unsigned)h, (int)st);
+			}
+			ok = D3D8DeviceSystemStart(a, b, c);
+			if(ok){
+				LogRwd3d9("devstart #%d: recovered on retry %d", g_devStartCount, attempt);
+				break;
+			}
+		}
+	}
+	if(!ok){
+		LogRwd3d9("devstart #%d: D3D8DeviceSystemStart FAILED after retries", g_devStartCount);
 		return 0;
+	}
 	RwD3DDevice->QueryInterface(IID_IDirect3DDevice9, (void**)&d3d9device);
 	return 1;
 }
@@ -198,6 +342,8 @@ RwBool
 RwD3D9CreateVertexShader(const RwUInt32 *function, void **shader)
 {
 	HRESULT res = d3d9device->CreateVertexShader((DWORD*)function, (IDirect3DVertexShader9**)shader);
+	if(res >= 0 && shader)
+		TrackShader(*shader);
 	return res >= 0;
 }
 
@@ -205,6 +351,8 @@ RwBool
 RwD3D9CreatePixelShader(const RwUInt32 *function, void **shader)
 {
 	HRESULT res = d3d9device->CreatePixelShader((DWORD*)function, (IDirect3DPixelShader9**)shader);
+	if(res >= 0 && shader)
+		TrackShader(*shader);
 	return res >= 0;
 }
 
