@@ -32,6 +32,11 @@ void *LastVertexDecl = INVALID;
 // --- minimal logging -------------------------------------------------------
 static int g_devStartCount = 0;
 
+// RsGlobal (640/480 defaults init): III 0x8F4360, VC 0x9B48D8.
+// width/height = +4/+8, maximumWidth/maximumHeight = +0xC/+0x10.
+// addressIII10, addressIII11, addressIIIsteam, addressvc10, addressvc11, addressVCsteam
+static int *rsGlobal = AddressByVersion<int*>(0x8F4360, 0x8F4360, 0x8F4360, 0x9B48D8, 0x9B48D8, 0);
+
 // --- config (rwd3d9.ini next to gta3.exe) ---------------------------------
 // No ini at all -> logging fully disabled.
 // Ini present   -> logging enabled unless Log=0.
@@ -278,7 +283,12 @@ D3D8DeviceSystemStart_hook(void *a, void *b, void *c)
 			// restart; if the display is stuck in a transitional mode, a fullscreen
 			// CreateDevice keeps failing. Set the mode explicitly and retry.
 			if(attempt % 3 == 0){
-				DWORD w = *(DWORD*)0x8F436C, h = *(DWORD*)0x8F4370;
+				int w = rsGlobal ? rsGlobal[3] : 0;
+				int h = rsGlobal ? rsGlobal[4] : 0;
+				if(w < 320 || w > 7680 || h < 200 || h > 4320){
+					LogRwd3d9("devstart #%d: bad RsGlobal mode %dx%d, skip", g_devStartCount, w, h);
+					continue;
+				}
 				DEVMODEA dm = {0};
 				dm.dmSize = sizeof(dm);
 				dm.dmPelsWidth = w;
